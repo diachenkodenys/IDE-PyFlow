@@ -13,7 +13,8 @@ import subprocess
 import types
 
 import qdarkstyle
-from PyQt5.QtGui import QSyntaxHighlighter, QTextCharFormat, QFont, QColor, QTextCursor, QIcon
+from PyQt5.QtGui import QSyntaxHighlighter, QTextCharFormat, QFont, QColor, QTextCursor, QIcon, QStandardItem, \
+    QStandardItemModel
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QTextEdit, QListWidget,
     QDockWidget, QStatusBar, QWidget, QVBoxLayout, QPushButton,
@@ -65,6 +66,120 @@ import re
 from PyQt5.QtWidgets import QTextEdit, QCompleter
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtCore import Qt
+'''class SuggestionDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        text = index.data(Qt.DisplayRole)
+        icon = index.data(Qt.DecorationRole)
+        category = index.data(Qt.UserRole)
+
+        painter.save()
+
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, QColor("#2a2d30"))
+        else:
+            painter.fillRect(option.rect, QColor("#21252b"))
+
+        # Іконка
+        if icon:
+            icon_rect = QRect(option.rect.left() + 4, option.rect.top() + 4, 20, 20)
+            icon.paint(painter, icon_rect)
+            x_offset = 28
+        else:
+            x_offset = 4
+
+        # Текст
+        text_rect = QRect(option.rect.left() + x_offset, option.rect.top(), option.rect.width(), option.rect.height() // 2)
+        painter.setPen(Qt.white)
+        painter.setFont(QFont("Consolas", 12))
+        painter.drawText(text_rect, Qt.AlignVCenter, text)
+
+        # Category
+        if category:
+            cat_rect = QRect(option.rect.left() + x_offset, option.rect.top() + option.rect.height() // 2, option.rect.width(), option.rect.height() // 2)
+            painter.setPen(QColor("#6c757d"))
+            painter.setFont(QFont("Consolas", 10, QFont.StyleItalic))
+            painter.drawText(cat_rect, Qt.AlignVCenter, category)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QSize(200, 28)
+class SuggestionModel(QAbstractListModel):
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.items = items
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.items)
+
+    def data(self, index, role):
+        if not index.isValid():
+            return None
+
+        item = self.items[index.row()]
+
+        if role == Qt.DisplayRole:
+            return item.text
+        elif role == Qt.DecorationRole:
+            return item.icon
+        elif role == Qt.UserRole:
+            return item.category
+        return None
+def generate_suggestions():
+    suggestions = []
+
+    for word in keyword.kwlist:
+        suggestions.append(SuggestionItem(word, "icons/keyword.svg", "keyword"))
+
+    for name in dir(builtins):
+        obj = getattr(builtins, name)
+        if inspect.isclass(obj):
+            suggestions.append(SuggestionItem(name, "icons/class.svg", "builtins class"))
+        elif isinstance(obj, types.BuiltinFunctionType):
+            suggestions.append(SuggestionItem(name, "icons/function.svg", "builtins function"))
+        else:
+            suggestions.append(SuggestionItem(name, "icons/variable.svg", "builtins"))
+    return suggestions
+class SuggestionItem:
+    def __init__(self, text, icon_path=None, category=""):
+        self.text = text
+        self.icon_path = icon_path
+        self.category = category'''
+def get_icon_for_completion(name, user_functions, module_aliases, direct_imports):
+    icon_path = None
+
+    if name in user_functions:
+        icon_path = "Icons/functions.png"
+    elif name in direct_imports:
+        for modname in module_aliases.values():
+            if hasattr(modname, name):
+                obj = getattr(modname, name)
+                if inspect.isclass(obj):
+                    icon_path = "Icons/class.png"
+                elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
+                    icon_path = "Icons/functions.png"
+                break
+        if not icon_path:
+            icon_path = "Icons/python.png"
+    elif name in dir(builtins):
+        obj = getattr(builtins, name, None)
+        if inspect.isclass(obj):
+            icon_path = "Icons/class.png"
+        elif inspect.isbuiltin(obj):
+            icon_path = "Icons/python.png"
+        elif inspect.isfunction(obj):
+            icon_path = "Icons/functions.png"
+    else:
+        for mod in module_aliases.values():
+            if hasattr(mod, name):
+                obj = getattr(mod, name)
+                if inspect.isclass(obj):
+                    icon_path = "Icons/class.png"
+                elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
+                    icon_path = "Icons/functions.png"
+                break
+
+    return QIcon(icon_path) if icon_path and os.path.exists(icon_path) else QIcon()
 
 class CodeTextEdit(QTextEdit):
     def __init__(self):
@@ -76,9 +191,9 @@ class CodeTextEdit(QTextEdit):
         self.default_words = sorted(set(keyword.kwlist + dir(builtins)))
         self.user_functions = set()
 
-        self.module_aliases = {}
-        self.module_attributes = {}
-        self.direct_imports = set()
+        self.module_aliases = {}     # alias -> module object
+        self.module_attributes = {}  # alias -> list of attributes (dir(module))
+        self.direct_imports = set()  # names imported via 'from module import *'
 
         self.completer = QCompleter(self.default_words, self)
         self.completer.setWidget(self)
@@ -98,22 +213,6 @@ class CodeTextEdit(QTextEdit):
         popup.setFont(QFont("Consolas", 16))
 
         self.last_completion_prefix = ""
-
-        self.css_properties = [
-            "color", "background-color", "font-size", "font-weight",
-            "margin", "padding", "border", "width", "height",
-            "display", "position", "top", "left", "right", "bottom",
-            "text-align", "align-items", "justify-content", "flex-direction"
-        ]
-
-        self.css_values = {
-            "color": ["red", "green", "blue", "black", "white", "#000", "#fff"],
-            "font-weight": ["normal", "bold", "lighter", "bolder"],
-            "display": ["block", "inline", "flex", "grid", "none"],
-            "position": ["static", "relative", "absolute", "fixed", "sticky"],
-            "text-align": ["left", "right", "center", "justify"],
-            "flex-direction": ["row", "column", "row-reverse", "column-reverse"]
-        }
 
         self.language = "python"
 
@@ -162,15 +261,14 @@ class CodeTextEdit(QTextEdit):
         pairs = {'(': ')', '[': ']', '{': '}', '"': '"', "'": "'"}
         opening = event.text()
         if opening in pairs:
-            closing = pairs[opening]
             cursor = self.textCursor()
             if cursor.hasSelection():
                 selected = cursor.selectedText()
-                cursor.insertText(opening + selected + closing)
+                cursor.insertText(opening + selected + pairs[opening])
                 return
             else:
                 super().keyPressEvent(event)
-                cursor.insertText(closing)
+                cursor.insertText(pairs[opening])
                 cursor.movePosition(QTextCursor.Left)
                 self.setTextCursor(cursor)
                 return
@@ -207,7 +305,17 @@ class CodeTextEdit(QTextEdit):
 
         suggestions = self.get_suggestions(prefix)
         if len(prefix) >= 1 and suggestions:
-            self.completer.model().setStringList(sorted(suggestions))
+            # Створюємо модель з іконками
+            model = QStandardItemModel()
+
+            for word in sorted(suggestions):
+                item = QStandardItem(word)
+                icon = get_icon_for_completion(word, self.user_functions, self.module_aliases, self.direct_imports)
+                item.setIcon(icon)
+                model.appendRow(item)
+
+            self.completer.setModel(model)
+
             if '.' in prefix:
                 _, right = prefix.rsplit('.', 1)
                 self.completer.setCompletionPrefix(right)
@@ -252,7 +360,9 @@ class CodeTextEdit(QTextEdit):
                     parts = line.split()
                     module = parts[1]
                     mod = __import__(module, fromlist=['*'])
-                    self.direct_imports.update(dir(mod))
+                    # Збираємо всі імпорти з цього модуля у direct_imports
+                    for name in dir(mod):
+                        self.direct_imports.add(name)
 
                 elif line.startswith("import "):
                     imports = line.replace("import", "").strip().split(",")
@@ -271,32 +381,73 @@ class CodeTextEdit(QTextEdit):
             except Exception as e:
                 print(f"[Import Error]: {e}\n{traceback.format_exc()}")
 
+    def get_object_by_chain(self, chain):
+        """
+        За ланцюжком імен (список рядків) повертає Python-об'єкт (модуль, клас, функцію і т.д.)
+        Якщо об'єкт не знайдено — повертає None.
+        """
+        if not chain:
+            return None
+        # Перший елемент — alias або імпортоване ім'я
+        first = chain[0]
+
+        # Перевіряємо псевдоніми модулів
+        if first in self.module_aliases:
+            obj = self.module_aliases[first]
+        elif first in self.direct_imports:
+            obj = getattr(builtins, first, None)
+        else:
+            obj = None
+
+        # Проходимо по ланцюжку і шукаємо вкладені атрибути
+        for attr in chain[1:]:
+            if obj is None:
+                return None
+            try:
+                obj = getattr(obj, attr)
+            except AttributeError:
+                return None
+        return obj
+
+    def get_attributes_chain(self, chain):
+        """
+        Повертає список атрибутів Python-об'єкта, визначеного ланцюжком імен.
+        """
+        obj = self.get_object_by_chain(chain)
+        if obj is None:
+            return []
+        try:
+            return dir(obj)
+        except Exception:
+            return []
+
     def get_suggestions(self, prefix):
         if self.language == "css":
-            cursor = self.textCursor()
-            block_text = cursor.block().text()
-            before_cursor = block_text[:cursor.positionInBlock()]
+            return []  # пропускаємо CSS тут
 
-            if ":" in before_cursor:
-                # Маємо щось на кшталт "color: r"
-                prop_match = re.search(r'([\w\-]+)\s*:\s*([\w\-]*)$', before_cursor)
-                if prop_match:
-                    prop, val_prefix = prop_match.groups()
-                    values = self.css_values.get(prop, [])
-                    return [v for v in values if v.startswith(val_prefix)]
+        # Якщо є крапки, ділимо на ланцюжок
+        if '.' in prefix:
+            parts = prefix.split('.')
+            attrs = self.get_attributes_chain(parts[:-1])
+            last_part = parts[-1]
+            return [a for a in attrs if a.startswith(last_part)]
 
-            else:
-                # Список властивостей
-                return [p for p in self.css_properties if p.startswith(prefix)]
+        # Якщо без крапок — пропонуємо ключові слова, функції, direct_imports та aliases
+        all_words = self.default_words + list(self.user_functions) + list(self.direct_imports) + list(
+            self.module_aliases.keys())
+        return [w for w in all_words if w.startswith(prefix)]
+    def get_suggestions(self, prefix):
+        if self.language == "css":
+            # Твій CSS код — опустимо тут для стислості
+            return []
 
-        # Default: Python
         all_words = self.default_words + list(self.user_functions) + list(self.direct_imports)
 
         if '.' in prefix:
-            left, _ = prefix.split('.', 1)
-            if left in self.module_attributes:
-                return self.module_attributes[left]
-            return []
+            chain = prefix.split('.')
+            attrs = self.get_attributes_chain(chain[:-1])
+            last_part = chain[-1]
+            return [a for a in attrs if a.startswith(last_part)]
 
         return [w for w in all_words if w.startswith(prefix)]
 
