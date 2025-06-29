@@ -1,3 +1,4 @@
+import ast
 import builtins
 import inspect
 import io
@@ -19,10 +20,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QTextEdit, QListWidget,
     QDockWidget, QStatusBar, QWidget, QVBoxLayout, QPushButton,
     QFileDialog, QHBoxLayout, QInputDialog, QMessageBox,
-    QLineEdit, QListWidgetItem, QStyle, QPlainTextEdit, QComboBox, QLabel, QCompleter, QStyledItemDelegate
+    QLineEdit, QListWidgetItem, QStyle, QPlainTextEdit, QComboBox, QLabel, QCompleter, QStyledItemDelegate, QToolTip
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QRegExp, QProcess, QTimer, QSettings, QStringListModel, \
-    QAbstractListModel, QModelIndex, QRect, QSize
+    QAbstractListModel, QModelIndex, QRect, QSize, QThreadPool, QRunnable, QPoint
 
 from PyQt5.QtWidgets import QTextEdit
 from PyQt5.QtGui import QTextCursor
@@ -145,15 +146,26 @@ class SuggestionItem:
         self.text = text
         self.icon_path = icon_path
         self.category = category'''
-def get_icon_for_completion(name, user_functions, module_aliases, direct_imports):
+def get_icon_for_completion(name, user_functions, module_aliases, direct_imports, direct_import_sources, get_object_by_chain):
+    import os
     icon_path = None
 
-    if name in user_functions:
+    if "." in name:
+        chain = name.split(".")
+        obj = get_object_by_chain(chain)
+        if obj:
+            if inspect.isclass(obj):
+                icon_path = "Icons/class.png"
+            elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
+                icon_path = "Icons/functions.png"
+            else:
+                icon_path = "Icons/python.png"
+    elif name in user_functions:
         icon_path = "Icons/functions.png"
     elif name in direct_imports:
-        for modname in module_aliases.values():
-            if hasattr(modname, name):
-                obj = getattr(modname, name)
+        for mod in direct_import_sources:
+            if hasattr(mod, name):
+                obj = getattr(mod, name)
                 if inspect.isclass(obj):
                     icon_path = "Icons/class.png"
                 elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
@@ -165,10 +177,10 @@ def get_icon_for_completion(name, user_functions, module_aliases, direct_imports
         obj = getattr(builtins, name, None)
         if inspect.isclass(obj):
             icon_path = "Icons/class.png"
-        elif inspect.isbuiltin(obj):
-            icon_path = "Icons/python.png"
-        elif inspect.isfunction(obj):
+        elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
             icon_path = "Icons/functions.png"
+        else:
+            icon_path = "Icons/python.png"
     else:
         for mod in module_aliases.values():
             if hasattr(mod, name):
@@ -216,6 +228,17 @@ class CodeTextEdit(QTextEdit):
 
         self.language = "python"
 
+        self.highlighter = SimpleHighlighter(self.document())
+
+        self.setMouseTracking(True)
+        self.tooltip_timer = QTimer()
+        self.tooltip_timer.setSingleShot(True)
+        self.tooltip_timer.setInterval(800)
+        self.tooltip_timer.timeout.connect(self._show_error_tooltip)
+        self.last_mouse_pos = QPoint()
+
+        self.direct_import_sources = []
+
     def insert_completion(self, completion):
         tc = self.textCursor()
         prefix = self.last_completion_prefix
@@ -237,6 +260,7 @@ class CodeTextEdit(QTextEdit):
         tc.removeSelectedText()
         tc.insertText(completion)
         self.setTextCursor(tc)
+
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -291,7 +315,7 @@ class CodeTextEdit(QTextEdit):
             return
 
         super().keyPressEvent(event)
-
+        self.highlighter.schedule_error_analysis(self.toPlainText())
         # Оновити імена функцій та імпорти
         self.extract_function_names()
         self.parse_imports()
@@ -310,7 +334,15 @@ class CodeTextEdit(QTextEdit):
 
             for word in sorted(suggestions):
                 item = QStandardItem(word)
-                icon = get_icon_for_completion(word, self.user_functions, self.module_aliases, self.direct_imports)
+                icon = get_icon_for_completion(
+                    word,
+                    self.user_functions,
+                    self.module_aliases,
+                    self.direct_imports,
+                    self.direct_import_sources,
+                    self.get_object_by_chain
+                )
+
                 item.setIcon(icon)
                 model.appendRow(item)
 
@@ -360,10 +392,9 @@ class CodeTextEdit(QTextEdit):
                     parts = line.split()
                     module = parts[1]
                     mod = __import__(module, fromlist=['*'])
-                    # Збираємо всі імпорти з цього модуля у direct_imports
-                    for name in dir(mod):
-                        self.direct_imports.add(name)
-
+                    self.direct_import_sources.append(mod)  # зберігаємо модуль
+                    self.direct_imports.update(dir(mod))
+                    self.direct_import_sources.append(mod)
                 elif line.startswith("import "):
                     imports = line.replace("import", "").strip().split(",")
                     for imp in imports:
@@ -382,24 +413,27 @@ class CodeTextEdit(QTextEdit):
                 print(f"[Import Error]: {e}\n{traceback.format_exc()}")
 
     def get_object_by_chain(self, chain):
-        """
-        За ланцюжком імен (список рядків) повертає Python-об'єкт (модуль, клас, функцію і т.д.)
-        Якщо об'єкт не знайдено — повертає None.
-        """
         if not chain:
             return None
-        # Перший елемент — alias або імпортоване ім'я
+
         first = chain[0]
 
-        # Перевіряємо псевдоніми модулів
+        # 1. alias
         if first in self.module_aliases:
             obj = self.module_aliases[first]
+        # 2. direct import (from ... import *)
         elif first in self.direct_imports:
-            obj = getattr(builtins, first, None)
+            obj = None
+            for mod in self.direct_import_sources:
+                if hasattr(mod, first):
+                    obj = getattr(mod, first)
+                    break
+            if obj is None:
+                obj = getattr(builtins, first, None)
         else:
             obj = None
 
-        # Проходимо по ланцюжку і шукаємо вкладені атрибути
+        # Пройти по решті атрибутів
         for attr in chain[1:]:
             if obj is None:
                 return None
@@ -407,6 +441,7 @@ class CodeTextEdit(QTextEdit):
                 obj = getattr(obj, attr)
             except AttributeError:
                 return None
+
         return obj
 
     def get_attributes_chain(self, chain):
@@ -436,7 +471,8 @@ class CodeTextEdit(QTextEdit):
         all_words = self.default_words + list(self.user_functions) + list(self.direct_imports) + list(
             self.module_aliases.keys())
         return [w for w in all_words if w.startswith(prefix)]
-    def get_suggestions(self, prefix):
+
+    """def get_suggestions(self, prefix):
         if self.language == "css":
             # Твій CSS код — опустимо тут для стислості
             return []
@@ -449,8 +485,23 @@ class CodeTextEdit(QTextEdit):
             last_part = chain[-1]
             return [a for a in attrs if a.startswith(last_part)]
 
-        return [w for w in all_words if w.startswith(prefix)]
+        return [w for w in all_words if w.startswith(prefix)]"""
 
+
+
+    def mouseMoveEvent(self, event):
+        self.last_mouse_pos = event.pos()
+        self.tooltip_timer.start()
+        super().mouseMoveEvent(event)
+
+    def _show_error_tooltip(self):
+        cursor = self.cursorForPosition(self.last_mouse_pos)
+        pos = cursor.position()
+        msg = self.highlighter.get_error_at_pos(pos)
+        if msg:
+            QToolTip.showText(self.mapToGlobal(self.last_mouse_pos), msg, self)
+        else:
+            QToolTip.hideText()
 
 
 
@@ -459,12 +510,20 @@ highlight_dict = {
     "#C76738": keyword.kwlist,
     "#B1076C": [name for name in dir(object) if name.startswith('__') and name.endswith('__')],  # магічні методи
 }
-
+print(keyword.kwlist)
 class SimpleHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
         self.rules = []
-        for color, words in highlight_dict.items():
+
+        # Ключові слова з кольором (example: {"#cc7832": ["if", "else"]})
+        self.highlight_dict = {
+            "purple": [name for name in dir(builtins) if callable(getattr(builtins, name))],
+            "#C76738": keyword.kwlist,
+            "#B1076C": [name for name in dir(object) if name.startswith('__') and name.endswith('__')],
+            # магічні методи
+        }
+        for color, words in self.highlight_dict.items():
             fmt = QTextCharFormat()
             fmt.setForeground(QColor(color))
             fmt.setFontWeight(QFont.Bold)
@@ -472,47 +531,185 @@ class SimpleHighlighter(QSyntaxHighlighter):
                 pattern = QRegExp(rf'\b{word}\b')
                 self.rules.append((pattern, fmt))
 
-
+        # Строки
         string_format = QTextCharFormat()
         string_format.setForeground(QColor("#5CAA5B"))
         self.rules.append((QRegExp(r'"[^"\\]*(\\.[^"\\]*)*"'), string_format))
         self.rules.append((QRegExp(r"'[^'\\]*(\\.[^'\\]*)*'"), string_format))
 
+        # Числа
         number_format = QTextCharFormat()
         number_format.setForeground(QColor(86, 156, 214))
         self.rules.append((QRegExp(r'\b\d+(\.\d+)?\b'), number_format))
 
+        # Коментарі
         comment_format = QTextCharFormat()
         comment_format.setForeground(QColor("#7A7E85"))
         self.rules.append((QRegExp(r'#.*'), comment_format))
 
+        # Багаторядкові строки
         multiline_format = QTextCharFormat()
         multiline_format.setForeground(QColor("#4A7F62"))
         self.rules.append((QRegExp(r"'''[^']*'''"), multiline_format))
         self.rules.append((QRegExp(r'"""[^"]*"""'), multiline_format))
 
-        # Формат для имени функции
+        # Ім’я функції
         self.funcname_format = QTextCharFormat()
-        self.funcname_format.setForeground(QColor(86, 156, 214))  # светло-синий
+        self.funcname_format.setForeground(QColor(86, 156, 214))
+
+        # Червоне підкреслення
+        self.error_format = QTextCharFormat()
+        self.error_format.setUnderlineColor(QColor("red"))
+        self.error_format.setUnderlineStyle(QTextCharFormat.SpellCheckUnderline)
+
+        self.error_items = []  # (start, end, message, is_error)
+
+        self.thread_pool = QThreadPool()
+
+        self._pending_code = ""
+        self._analysis_timer = QTimer()
+        self._analysis_timer.setSingleShot(True)
+        self._analysis_timer.setInterval(500)
+        self._analysis_timer.timeout.connect(self._run_delayed_flake8)
 
     def highlightBlock(self, text):
-        # Спочатку підсвічуємо ім’я функції після def (до першої дужки)
+        block_pos = self.currentBlock().position()
+
+        # Ім’я функції
         match = re.search(r'\bdef\s+([A-Za-z_]\w*)', text)
         if match:
             func_name = match.group(1)
-            if not re.fullmatch(r'__\w+__', func_name):  # виключаємо дандери (__init__, __str__, ...)
-                start = match.start(1)
-                length = len(func_name)
-                self.setFormat(start, length, self.funcname_format)
+            start = match.start(1)
+            self.setFormat(start, len(func_name), self.funcname_format)
 
-        # Потім застосовуємо всі інші правила
+        # Основні правила
         for pattern, fmt in self.rules:
             index = pattern.indexIn(text)
             while index >= 0:
                 length = pattern.matchedLength()
-                if length > 0:
-                    self.setFormat(index, length, fmt)
+                self.setFormat(index, length, fmt)
                 index = pattern.indexIn(text, index + length)
+
+        # Помилки
+        for start, end, _, is_error in self.error_items:
+            if not is_error:
+                continue
+            if block_pos <= start < block_pos + len(text):
+                rel_start = start - block_pos
+                length = end - start
+                self.setFormat(rel_start, min(length, len(text) - rel_start), self.error_format)
+
+    def schedule_error_analysis(self, code_text: str):
+        self._pending_code = code_text
+        self._analysis_timer.start()
+
+    def _run_delayed_flake8(self):
+        self.update_errors(self._pending_code)
+
+    def update_errors(self, code_text: str):
+        self.error_items.clear()
+        lines = code_text.splitlines()
+
+        # AST SyntaxError
+        try:
+            ast.parse(code_text)
+        except SyntaxError as e:
+            if e.lineno and 1 <= e.lineno <= len(lines):
+                line_start = sum(len(lines[i]) + 1 for i in range(e.lineno - 1))
+                start = line_start + (e.offset - 1 if e.offset else 0)
+                end = line_start + len(lines[e.lineno - 1])
+                self.error_items.append((start, end, f"SyntaxError: {e.msg}", True))
+
+        # flake8 у фоні
+        worker = Flake8Worker(code_text)
+        worker.signals.finished.connect(self._on_flake8_finished)
+        self.thread_pool.start(worker)
+        self.rehighlight()
+
+    def _on_flake8_finished(self, items):
+        self.error_items += items
+        self.rehighlight()
+
+    def get_error_at_pos(self, pos: int):
+        for start, end, msg, _ in self.error_items:
+            if start <= pos <= end:
+                return msg
+        return ""
+
+
+class Flake8WorkerSignals(QObject):
+    finished = pyqtSignal(list)  # список error_items: (start, end, msg, is_error)
+
+class Flake8Worker(QRunnable):
+    def __init__(self, code_text):
+        super().__init__()
+        self.code_text = code_text
+        self.signals = Flake8WorkerSignals()
+
+    def run(self):
+        import tempfile, subprocess, re
+
+        errors = []
+        lines = self.code_text.splitlines()
+
+        # 1. Збираємо модулі, імпортовані з *
+        import_star_modules = []
+        for line in lines:
+            if line.strip().startswith("from ") and "import *" in line:
+                try:
+                    modname = line.split()[1]
+                    import_star_modules.append(modname)
+                except IndexError:
+                    continue
+
+        # 2. Завантажуємо всі імена з цих модулів
+        imported_names = set()
+        for modname in import_star_modules:
+            try:
+                mod = __import__(modname, fromlist=["*"])
+                imported_names.update(dir(mod))
+            except Exception as e:
+                print(f"[Import * error] {modname}: {e}")
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w", encoding="utf-8") as f:
+                f.write(self.code_text)
+                path = f.name
+
+            result = subprocess.run(
+                ["flake8", "--ignore=E203,E231,E302,F401,W291,W293,W391,F403,E275", path],  # F403 = import * may override ["flake8", "--ignore=E203,E231,E302,F401,W291,W293,W391,F403,E275,F405", path]
+                capture_output=True,
+                text=True
+            )
+
+            output = result.stdout.strip().splitlines()
+
+            for line in output:
+                match = re.match(r'.+:(\d+):(\d+):\s+([A-Z]\d+)\s+(.+)', line)
+                if not match:
+                    continue
+
+                lineno, col, code, msg = int(match.group(1)), int(match.group(2)), match.group(3), match.group(4)
+                if 1 <= lineno <= len(lines):
+                    line_start = sum(len(lines[i]) + 1 for i in range(lineno - 1))
+                    start = line_start + col - 1
+                    end = line_start + len(lines[lineno - 1])
+
+                    # 3. Якщо це F405 і ім’я реально існує — не додаємо
+                    if code == "F405":
+                        # Витягуємо ім’я (може бути в лапках або без)
+                        var_match = re.search(r"'?([A-Za-z_][A-Za-z0-9_]*)'?", msg)
+                        if var_match:
+                            varname = var_match.group(1)
+                            if varname in imported_names:
+                                continue  # ім'я реально імпортовано — не вважаємо помилкою
+
+                    errors.append((start, end, f"{code}: {msg.strip()}", True))
+
+        except Exception as e:
+            print("Flake8 analysis failed:", e)
+
+        self.signals.finished.emit(errors)
 
 # --- Клас для виконання Python коду у окремому потоці ---
 class CodeExecutor(QObject):
@@ -786,6 +983,10 @@ class PyCharmClone(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.terminal_dock)
 
         self.setStatusBar(QStatusBar())
+
+        analyze_btn = QPushButton("🧠 Аналіз коду")
+        analyze_btn.clicked.connect(self.analyze_code)
+        top_layout.addWidget(analyze_btn)
 
     def change_theme(self, index):
         self.settings.setValue("theme_index", index)
@@ -1620,6 +1821,33 @@ class PyCharmClone(QMainWindow):
                 self.last_file_set = current_file_set
         except Exception as e:
             print(f"[watch error] {e}")  # або логувати в IDE
+
+    def run_static_analysis(self, code_text):
+        import tempfile, subprocess
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.py', mode='w', encoding='utf-8') as tmp:
+            tmp.write(code_text)
+            tmp_path = tmp.name
+
+        try:
+            result = subprocess.run(
+                ["flake8", tmp_path],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            return result.stdout.strip()
+        except Exception as e:
+            return f"Помилка аналізу: {e}"
+
+    def analyze_code(self):
+        current_widget = self.tabs.currentWidget()
+        if isinstance(current_widget, QTextEdit):
+            code = current_widget.toPlainText()
+            result = self.run_static_analysis(code)
+            if not result:
+                QMessageBox.information(self, "Аналіз коду", "✅ Все виглядає добре! Помилок не знайдено.")
+            else:
+                QMessageBox.warning(self, "Знайдено проблеми", result)
 if __name__=="__main__":
     try:
         app = QApplication(sys.argv)
